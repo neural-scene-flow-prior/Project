@@ -1,282 +1,292 @@
-"""optimize over a network structure."""
-
-import argparse
-import logging
-import os
-import copy
-
 import matplotlib.pyplot as plt
 import numpy as np
 import open3d as o3d
-import pandas as pd
-import torch
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+# NOTE: need to comment this line if do not have GUI.
+from mayavi import mlab
 
-from model import Neural_Prior
-import config
-from data import (ArgoverseSceneFlowDataset, KITTISceneFlowDataset,
-                  NuScenesSceneFlowDataset, FlyingThings3D)
-from utils import scene_flow_metrics, Timers, GeneratorWrap, EarlyStopping
-from loss import my_chamfer_fn
-from visualize import show_flows, flow_to_rgb, custom_draw_geometry_with_key_callback
+from collections import namedtuple
+from itertools import accumulate
+from typing import Optional, Tuple
+from matplotlib.ticker import AutoMinorLocator
+
+DEFAULT_TRANSITIONS = (15, 6, 4, 11, 13, 6)
+
+BLUE = (94/255, 129/255, 160/255)
+GREEN = (163/255, 190/255, 128/255)
+RED = (191/255, 97/255, 106/255)
+PURPLE = (180/255, 142/255, 160/255)
+OPACITY = 1.0
 
 
-device = torch.device("cuda:0")
+def show_flows(pc1, pc2, flow, inverse=False):
+    if type(pc1) is not np.ndarray:
+        pc1 = pc1.cpu().numpy()
+        pc2 = pc2.cpu().numpy()
+        flow = flow.detach().cpu().numpy()
 
+    pc1_deform = pc1 + flow
 
-def solver(
-    pc1: torch.Tensor,
-    pc2: torch.Tensor,
-    flow: torch.Tensor,
-    options: argparse.Namespace,
-    net: torch.nn.Module,
-    i: int,
-):
+    OPACITY = 1.0
+    fig = mlab.figure(size=(800, 600), bgcolor=(1,1,1))
+    mlab.points3d(pc2[:,0], pc2[:,1], pc2[:,2], color=GREEN, figure=fig, opacity=OPACITY, scale_factor=0.07, resolution=25)
+    mlab.points3d(pc1[:,0], pc1[:,1], pc1[:,2], color=BLUE, figure=fig, opacity=1.0, scale_factor=0.07, resolution=25)
 
-    for param in net.parameters():
-        param.requires_grad = True
+    mlab.points3d(pc1_deform[:,0], pc1_deform[:,1], pc1_deform[:,2], color=RED, figure=fig, opacity=OPACITY, scale_factor=0.07, resolution=25)
+    obj = mlab.quiver3d(pc1[:,0], pc1[:,1], pc1[:,2], flow[:,0], flow[:,1], flow[:,2], mode='arrow', colormap='spring', scale_factor=1.0, line_width=0.001, resolution=25, opacity=0.3)
+
+    obj.glyph.glyph_source.glyph_source.tip_length = 0.05
+    obj.glyph.glyph_source.glyph_source.tip_radius = 0.02
+    obj.glyph.glyph_source.glyph_source.shaft_radius = 0.005
+    obj.glyph.glyph_source.glyph_source.shaft_resolution = 95
     
-    if options.backward_flow:
-        net_inv = copy.deepcopy(net)
-        params = [{'params': net.parameters(), 'lr': options.lr, 'weight_decay': options.weight_decay},
-                {'params': net_inv.parameters(), 'lr': options.lr, 'weight_decay': options.weight_decay}]
+    mlab.show()
+    
+    pc1_o3d = o3d.geometry.PointCloud()
+    pc1_o3d.points = o3d.utility.Vector3dVector(pc1)
+    pc1_o3d.paint_uniform_color(BLUE)
+    pc1_o3d.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+    pc1_o3d.orient_normals_to_align_with_direction()
+
+    pc2_o3d = o3d.geometry.PointCloud()
+    pc2_o3d.points = o3d.utility.Vector3dVector(pc2)
+    pc2_o3d.paint_uniform_color(GREEN)
+    pc2_o3d.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+    pc2_o3d.orient_normals_to_align_with_direction()    
+
+    pc1_def_o3d = o3d.geometry.PointCloud()
+    pc1_def_o3d.points = o3d.utility.Vector3dVector(pc1_deform)
+    pc1_def_o3d.paint_uniform_color(RED)
+    pc1_def_o3d.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+    pc1_def_o3d.orient_normals_to_align_with_direction()
+    o3d.visualization.draw_geometries([pc1_o3d, pc2_o3d, pc1_def_o3d])
+
+
+def make_colorwheel(transitions: tuple=DEFAULT_TRANSITIONS) -> np.ndarray:
+    """Creates a colorwheel (borrowed/modified from flowpy).
+    A colorwheel defines the transitions between the six primary hues:
+    Red(255, 0, 0), Yellow(255, 255, 0), Green(0, 255, 0), Cyan(0, 255, 255), Blue(0, 0, 255) and Magenta(255, 0, 255).
+    Args:
+        transitions: Contains the length of the six transitions, based on human color perception.
+    Returns:
+        colorwheel: The RGB values of the transitions in the color space.
+    Notes:
+        For more information, see:
+        https://web.archive.org/web/20051107102013/http://members.shaw.ca/quadibloc/other/colint.htm
+        http://vision.middlebury.edu/flow/flowEval-iccv07.pdf
+    """
+    colorwheel_length = sum(transitions)
+    # The red hue is repeated to make the colorwheel cyclic
+    base_hues = map(
+        np.array, ([255, 0, 0], [255, 255, 0], [0, 255, 0], [0, 255, 255], [0, 0, 255], [255, 0, 255], [255, 0, 0])
+    )
+    colorwheel = np.zeros((colorwheel_length, 3), dtype="uint8")
+    hue_from = next(base_hues)
+    start_index = 0
+    for hue_to, end_index in zip(base_hues, accumulate(transitions)):
+        transition_length = end_index - start_index
+        colorwheel[start_index:end_index] = np.linspace(hue_from, hue_to, transition_length, endpoint=False)
+        hue_from = hue_to
+        start_index = end_index
+    return colorwheel
+
+
+def flow_to_rgb(
+    flow: np.ndarray,
+    flow_max_radius: Optional[float]=None,
+    background: Optional[str]="bright",
+) -> np.ndarray:
+    """Creates a RGB representation of an optical flow (borrowed/modified from flowpy).
+    Args:
+        flow: scene flow.
+            flow[..., 0] should be the x-displacement
+            flow[..., 1] should be the y-displacement
+            flow[..., 2] should be the z-displacement
+        flow_max_radius: Set the radius that gives the maximum color intensity, useful for comparing different flows.
+            Default: The normalization is based on the input flow maximum radius.
+        background: States if zero-valued flow should look 'bright' or 'dark'.
+    Returns: An array of RGB colors.
+    """
+    valid_backgrounds = ("bright", "dark")
+    if background not in valid_backgrounds:
+        raise ValueError(f"background should be one the following: {valid_backgrounds}, not {background}.")
+    wheel = make_colorwheel()
+    # For scene flow, it's reasonable to assume displacements in x and y directions only for visualization pursposes.
+    complex_flow = flow[..., 0] + 1j * flow[..., 1]
+    radius, angle = np.abs(complex_flow), np.angle(complex_flow)
+    if flow_max_radius is None:
+        flow_max_radius = np.max(radius)
+    if flow_max_radius > 0:
+        radius /= flow_max_radius
+    ncols = len(wheel)
+    # Map the angles from (-pi, pi] to [0, 2pi) to [0, ncols - 1)
+    angle[angle < 0] += 2 * np.pi
+    angle = angle * ((ncols - 1) / (2 * np.pi))
+    # Make the wheel cyclic for interpolation
+    wheel = np.vstack((wheel, wheel[0]))
+    # Interpolate the hues
+    (angle_fractional, angle_floor), angle_ceil = np.modf(angle), np.ceil(angle)
+    angle_fractional = angle_fractional.reshape((angle_fractional.shape) + (1,))
+    float_hue = (
+        wheel[angle_floor.astype(np.int)] * (1 - angle_fractional) + wheel[angle_ceil.astype(np.int)] * angle_fractional
+    )
+    ColorizationArgs = namedtuple(
+        'ColorizationArgs', ['move_hue_valid_radius', 'move_hue_oversized_radius', 'invalid_color']
+    )
+    def move_hue_on_V_axis(hues, factors):
+        return hues * np.expand_dims(factors, -1)
+    def move_hue_on_S_axis(hues, factors):
+        return 255. - np.expand_dims(factors, -1) * (255. - hues)
+    if background == "dark":
+        parameters = ColorizationArgs(
+            move_hue_on_V_axis, move_hue_on_S_axis, np.array([255, 255, 255], dtype=np.float)
+        )
     else:
-        params = net.parameters()
+        parameters = ColorizationArgs(move_hue_on_S_axis, move_hue_on_V_axis, np.array([0, 0, 0], dtype=np.float))
+    colors = parameters.move_hue_valid_radius(float_hue, radius)
+    oversized_radius_mask = radius > 1
+    colors[oversized_radius_mask] = parameters.move_hue_oversized_radius(
+        float_hue[oversized_radius_mask],
+        1 / radius[oversized_radius_mask]
+    )
+    return colors.astype(np.uint8)
+
+
+def calibration_pattern(
+    pixel_size: int=151,
+    flow_max_radius: float=1,
+    **flow_to_rgb_args
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Generates a calibration pattern to add as a legend to the scene flow plots.
+    Args:
+        pixel_size: Radius of the square test pattern.
+        flow_max_radius: The maximum radius value represented by the calibration pattern.
+        flow_to_rgb_args: kwargs passed to the flow_to_rgb function.
+    Returns:
+        calibration_img: The RGB image representation of the calibration pattern.
+        calibration_flow: The flow represented in the calibration_pattern.
+    """
+    half_width = pixel_size // 2
+    y_grid, x_grid = np.mgrid[:pixel_size, :pixel_size]
+    u = flow_max_radius * (x_grid / half_width - 1)
+    v = flow_max_radius * (y_grid / half_width - 1)
+    flow = np.zeros((pixel_size, pixel_size, 2))
+    flow[..., 0] = u
+    flow[..., 1] = v
+    flow_to_rgb_args["flow_max_radius"] = flow_max_radius
+    img = flow_to_rgb(flow, **flow_to_rgb_args)
+    return img, flow
+
+
+def attach_calibration_pattern(ax, **calibration_pattern_kwargs):
+    """Attach a calibration pattern to axes.
+    This function uses calibration_pattern to generate a figure.
+    Args:
+        calibration_pattern_kwargs: kwargs, optional
+            Parameters to be given to the calibration_pattern function.
+    Returns:
+        image_axes: matplotlib.AxesImage
+            See matplotlib.imshow documentation
+            Useful for changing the image dynamically
+        circle_artist: matplotlib.artist
+            See matplotlib.circle documentation
+            Useful for removing the circle from the figure
+    """
     
-    if options.optimizer == "sgd":
-        print('using SGD.')
-        optimizer = torch.optim.SGD(params, lr=options.lr, momentum=options.momentum, weight_decay=options.weight_decay)
-    elif options.optimizer == "adam":
-        print("Using Adam optimizer.")
-        optimizer = torch.optim.Adam(params, lr=options.lr, weight_decay=0)
-
-    total_losses = []
-    chamfer_losses = []
-
-    early_stopping = EarlyStopping(patience=options.early_patience, min_delta=0.0001)
-
-    if options.time:
-        timers = Timers()
-        timers.tic("solver_timer")
-
-    pc1 = pc1.cuda().contiguous()
-    pc2 = pc2.cuda().contiguous()
-    flow = flow.cuda().contiguous()
-
-    normal1 = None
-    normal2 = None
-
-    # ANCHOR: initialize best metrics
-    best_loss_1 = 10.
-    best_flow_1 = None
-    best_epe3d_1 = 1.
-    best_acc3d_strict_1 = 0.
-    best_acc3d_relax_1 = 0.
-    best_angle_error_1 = 1.
-    best_outliers_1 = 1.
-    best_epoch = 0
+    pattern, flow = calibration_pattern(**calibration_pattern_kwargs)
+    flow_max_radius = calibration_pattern_kwargs.get("flow_max_radius", 1)
+    extent = (-flow_max_radius, flow_max_radius) * 2
+    image = ax.imshow(pattern, extent=extent)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
     
-    for epoch in range(options.iters):
-        optimizer.zero_grad()
+    for spine in ("bottom", "left"):
+        ax.spines[spine].set_position("zero")
+        ax.spines[spine].set_linewidth(1)
+    ax.xaxis.set_minor_locator(AutoMinorLocator())
+    ax.yaxis.set_minor_locator(AutoMinorLocator())
+    attach_coord(ax, flow, extent=extent)
+    circle = plt.Circle((0, 0), flow_max_radius, fill=False, lw=1)
+    ax.add_artist(circle)
+    
+    return image, circle
 
-        flow_pred_1 = net(pc1)
-        pc1_deformed = pc1 + flow_pred_1
-        loss_chamfer_1, _ = my_chamfer_fn(pc2, pc1_deformed, normal2, normal1)
+
+def attach_coord(ax, flow, extent=None):
+    """Attach the flow value to the coordinate tooltip.
+    It allows you to see on the same figure, the RGB value of the pixel and the underlying value of the flow.
+    Shows cartesian and polar coordinates.
+    Args:
+        ax: matplotlib.axes
+            The axes the arrows should be plotted on.
+        flow: numpy.ndarray
+            scene flow.
+            flow[..., 0] should be the x-displacement
+            flow[..., 1] should be the y-displacement
+        extent: sequence_like, optional
+            Use this parameters in combination with matplotlib.imshow to resize the RGB plot.
+            See matplotlib.imshow extent parameter.
+            See attach_calibration_pattern
+    """
+    
+    height, width, _ = flow.shape
+    base_format = ax.format_coord
+    if extent is not None:
+        left, right, bottom, top = extent
+        x_ratio = width / (right - left)
+        y_ratio = height / (top - bottom)
         
-        if options.backward_flow:
-            flow_pred_1_prime = net_inv(pc1_deformed)
-            pc1_prime_deformed = pc1_deformed - flow_pred_1_prime
-            loss_chamfer_1_prime, _ = my_chamfer_fn(pc1_prime_deformed, pc1, normal2, normal1)
-        
-        if options.backward_flow:
-            loss_chamfer = loss_chamfer_1 + loss_chamfer_1_prime
+    def new_format_coord(x, y):
+        if extent is None:
+            int_x = int(x + 0.5)
+            int_y = int(y + 0.5)
         else:
-            loss_chamfer = loss_chamfer_1
-
-        loss = loss_chamfer
-
-        flow_pred_1_final = pc1_deformed - pc1
-        
-        if options.compute_metrics:
-            EPE3D_1, acc3d_strict_1, acc3d_relax_1, outlier_1, angle_error_1 = scene_flow_metrics(flow_pred_1_final, flow)
+            int_x = int((x - left) * x_ratio)
+            int_y = int((y - bottom) * y_ratio)
+        if 0 <= int_x < width and 0 <= int_y < height:
+            format_string = "Coord: x={}, y={} / Flow: ".format(int_x, int_y)
+            u, v = flow[int_y, int_x, :]
+            if np.isnan(u) or np.isnan(v):
+                format_string += "invalid"
+            else:
+                complex_flow = u - 1j * v
+                r, h = np.abs(complex_flow), np.angle(complex_flow, deg=True)
+                format_string += ("u={:.2f}, v={:.2f} (cartesian) ρ={:.2f}, θ={:.2f}° (polar)"
+                                  .format(u, v, r, h))
+            return format_string
         else:
-            EPE3D_1, acc3d_strict_1, acc3d_relax_1, outlier_1, angle_error_1 = 0, 0, 0, 0, 0
-
-        # ANCHOR: get best metrics
-        if loss <= best_loss_1:
-            best_loss_1 = loss.item()
-            best_epe3d_1 = EPE3D_1
-            best_flow_1 = flow_pred_1_final
-            best_epe3d_1 = EPE3D_1
-            best_acc3d_strict_1 = acc3d_strict_1
-            best_acc3d_relax_1 = acc3d_relax_1
-            best_angle_error_1 = angle_error_1
-            best_outliers_1 = outlier_1
-            best_epoch = epoch
-            
-        if epoch % 50 == 0:
-            logging.info(f"[Sample: {i}]"
-                        f"[Ep: {epoch}] [Loss: {loss:.5f}] "
-                        f" Metrics: flow 1 --> flow 2"
-                        f" [EPE: {EPE3D_1:.3f}] [Acc strict: {acc3d_strict_1 * 100:.3f}%]"
-                        f" [Acc relax: {acc3d_relax_1 * 100:.3f}%] [Angle error (rad): {angle_error_1:.3f}]"
-                        f" [Outl.: {outlier_1 * 100:.3f}%]")
-            
-        total_losses.append(loss.item())
-        chamfer_losses.append(loss_chamfer)
-
-        if options.animation:
-            yield flow_pred_1_final.detach().cpu().numpy()
-
-        if early_stopping.step(loss):
-            break
+            return base_format(x, y)
         
-        loss.backward()
-        optimizer.step()
+    ax.format_coord = new_format_coord
 
-    if options.time:
-        timers.toc("solver_timer")
-        time_avg = timers.get_avg("solver_timer")
-        logging.info(timers.print())
 
-    # ANCHOR: get the best metrics
-    info_dict = {
-        'loss': best_loss_1,
-        'EPE3D_1': best_epe3d_1,
-        'acc3d_strict_1': best_acc3d_strict_1,
-        'acc3d_relax_1': best_acc3d_relax_1,
-        'angle_error_1': best_angle_error_1,
-        'outlier_1': best_outliers_1,
-        'time': time_avg,
-        'epoch': best_epoch
-    }
-
-    # NOTE: visualization
-    if options.visualize:
-        fig = plt.figure(figsize=(13, 5))
-        ax = fig.gca()
-        ax.plot(total_losses, label="loss")
-        ax.legend(fontsize="14")
-        ax.set_xlabel("Iteration", fontsize="14")
-        ax.set_ylabel("Loss", fontsize="14")
-        ax.set_title("Loss vs iterations", fontsize="14")
+def custom_draw_geometry_with_key_callback(pcds):
+    def change_background_to_black(vis):
+        opt = vis.get_render_option()
+        opt.background_color = np.asarray([76/255, 86/255, 106/255])
+        # opt.background_color = np.asarray([7/255, 54/255, 66/255])
+        return False
+    
+    # def load_render_option(vis):
+    #     vis.get_render_option().load_from_json(
+    #         "../../TestData/renderoption.json")
+    #     return False
+    
+    def capture_depth(vis):
+        depth = vis.capture_depth_float_buffer()
+        plt.imshow(np.asarray(depth))
         plt.show()
-
-        idx = 0   
-        show_flows(pc1[idx], pc2[idx], best_flow_1[idx])
-        
-        # ANCHOR: new plot style
-        pc1_o3d = o3d.geometry.PointCloud()
-        colors_flow = flow_to_rgb(flow[0].cpu().numpy().copy())
-        pc1_o3d.points = o3d.utility.Vector3dVector(pc1[0].cpu().numpy().copy())
-        pc1_o3d.colors = o3d.utility.Vector3dVector(colors_flow / 255.0)
-        custom_draw_geometry_with_key_callback([pc1_o3d])  # Press 'k' to see with dark background.
-        
-    return info_dict
-
-
-def optimize_neural_prior(options, data_loader):
-    if options.time:
-        timers = Timers()
-        timers.tic("total_time")
-
-    save_dir_path = f"checkpoints/{options.exp_name}"
-
-    outputs = []
+        return False
     
-    if options.model == 'neural_prior':
-        net = Neural_Prior(filter_size=options.hidden_units, act_fn=options.act_fn, layer_size=options.layer_size).cuda()
-    else:
-        raise Exception("Model not available.")    
-
-    for i, data in tqdm(enumerate(data_loader), total=len(data_loader), smoothing=0.9):
-        logging.info(f"# Working on sample: {data_loader.dataset.datapath[i]}...")
-
-        pc1, pc2, flow = data
-        
-        if options.visualize:
-            idx = 0
-            # NOTE: ground truth flow
-            show_flows(pc1[idx], pc2[idx], flow[idx])
-
-        solver_generator = GeneratorWrap(solver(pc1, pc2, flow, options, net, i))
-        
-        if options.animation:
-            #TODO: save frames to make video.
-            info_dict = solver_generator.value
-        else:
-            for _ in solver_generator: pass
-            info_dict = solver_generator.value
-
-        # Collect results.
-        info_dict['filepath'] = data_loader.dataset.datapath[i]
-        outputs.append(info_dict)
-
-        print(info_dict)
-
-    if options.time:
-        timers.toc("total_time")
-        time_avg = timers.get_avg("total_time")
-        logging.info(timers.print())
-
-    df = pd.DataFrame(outputs)
-    df.loc['mean'] = df.mean()
-    logging.info(df.mean())
-    df.loc['total time'] = time_avg
-    df.to_csv('{:}.csv'.format(f"{save_dir_path}/results"))
-
-    logging.info("Finish optimization!")
+    def capture_image(vis):
+        image = vis.capture_screen_float_buffer()
+        plt.imshow(np.asarray(image))
+        plt.show()
+        return False
     
-    return
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Neural Scene Flow Prior.")
-    config.add_config(parser)
-    options = parser.parse_args()
-
-    exp_dir_path = f"checkpoints/{options.exp_name}"
-    if not os.path.exists(exp_dir_path):
-        os.makedirs(exp_dir_path)
-
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s [%(levelname)s] - %(message)s',
-        handlers=[logging.FileHandler(filename=f"{exp_dir_path}/run.log"), logging.StreamHandler()])
-    logging.info(options)
-    logging.getLogger("matplotlib").setLevel(logging.WARNING)
-
-    logging.info('---------------------------------------')
-    print_options = vars(options)
-    for key in print_options.keys():
-        logging.info(key+': '+str(print_options[key]))
-    logging.info('---------------------------------------')
-
-    torch.backends.cudnn.deterministic = True
-    torch.manual_seed(options.seed)
-    torch.cuda.manual_seed_all(options.seed)
-    np.random.seed(options.seed)
-
-    if options.dataset == "KITTISceneFlowDataset":
-        data_loader = DataLoader(
-            KITTISceneFlowDataset(options=options, train=False),
-            batch_size=options.batch_size, shuffle=False, drop_last=False, num_workers=12
-        )
-    elif options.dataset == "FlyingThings3D":
-        data_loader = DataLoader(
-            FlyingThings3D(options=options, partition="test"),
-            batch_size=options.batch_size, shuffle=False, drop_last=False, num_workers=12
-        )
-    elif options.dataset == "ArgoverseSceneFlowDataset":
-        data_loader = DataLoader(
-            ArgoverseSceneFlowDataset(options=options, partition=options.partition),
-            batch_size=options.batch_size, shuffle=False, drop_last=False, num_workers=12
-        )
-    elif options.dataset == "NuScenesSceneFlowDataset":
-        data_loader = DataLoader(
-            NuScenesSceneFlowDataset(options=options, partition="val"),
-            batch_size=options.batch_size, shuffle=False, drop_last=False, num_workers=12
-        )
-
-    optimize_neural_prior(options, data_loader)
+    key_to_callback = {}
+    key_to_callback[ord("K")] = change_background_to_black
+    # key_to_callback[ord("R")] = load_render_option
+    key_to_callback[ord(",")] = capture_depth
+    key_to_callback[ord(".")] = capture_image
+    o3d.visualization.draw_geometries_with_key_callbacks(pcds, key_to_callback)
+    
