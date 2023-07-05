@@ -262,20 +262,5 @@ if __name__ == "__main__":
             KITTISceneFlowDataset(options=options, train=False),
             batch_size=options.batch_size, shuffle=False, drop_last=False, num_workers=12
         )
-    elif options.dataset == "FlyingThings3D":
-        data_loader = DataLoader(
-            FlyingThings3D(options=options, partition="test"),
-            batch_size=options.batch_size, shuffle=False, drop_last=False, num_workers=12
-        )
-    elif options.dataset == "ArgoverseSceneFlowDataset":
-        data_loader = DataLoader(
-            ArgoverseSceneFlowDataset(options=options, partition=options.partition),
-            batch_size=options.batch_size, shuffle=False, drop_last=False, num_workers=12
-        )
-    elif options.dataset == "NuScenesSceneFlowDataset":
-        data_loader = DataLoader(
-            NuScenesSceneFlowDataset(options=options, partition="val"),
-            batch_size=options.batch_size, shuffle=False, drop_last=False, num_workers=12
-        )
-
+    
     optimize_neural_prior(options, data_loader)
